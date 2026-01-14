@@ -15,6 +15,48 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+async function requireAuth(req, res, next) {
+  try {
+    // 1. Read Authorization header
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Missing Authorization header' });
+    }
+
+    // 2. Extract JWT token
+    const token = authHeader.replace('Bearer ', '');
+
+    // 3. Validate token with Supabase
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const user = data.user;
+
+    // 4. Find which business this user belongs to
+    const { data: mapping, error: mapError } = await supabase
+      .from('business_users')
+      .select('business_id, role')
+      .eq('user_id', user.id)
+      .single();
+
+    if (mapError || !mapping) {
+      return res.status(403).json({ error: 'User not linked to business' });
+    }
+
+    // 5. Attach to request object
+    req.user = user;
+    req.businessId = mapping.business_id;
+    req.role = mapping.role;
+
+    // 6. Continue to actual API
+    next();
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 async function sendWhatsAppMessage(phone, text) {
   try {
     const params = new URLSearchParams();
@@ -158,41 +200,44 @@ await supabase.from('messages').insert([
   }
 
 });
+app.get('/customers', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
 
-app.get('/customers', async (req, res) => {
-  try {
-    // TEMP: single business
-    const { data: business } = await supabase
-      .from('businesses')
-      .select('*')
-      .limit(1)
-      .single();
+  const { data, error } = await supabase.rpc(
+    'get_customers_with_last_message',
+    { business_uuid: businessId }
+  );
 
-    if (!business) {
-      return res.status(404).json({ error: 'Business not found' });
-    }
-
-    const { data, error } = await supabase.rpc('get_customers_with_last_message', {
-      business_uuid: business.id
-    });
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (error) {
+    return res.status(500).json({ error: error.message });
   }
+  console.log('AUTH HEADER:', req.headers.authorization);
+  res.json(data);
 });
-app.get('/customers/:customerId/messages', async (req, res) => {
-  const { customerId } = req.params;
 
+
+app.get('/customers/:id/messages', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const businessId = req.businessId;
+
+  // First: verify customer belongs to this business
+  const { data: customer, error: customerError } = await supabase
+    .from('customers')
+    .select('id')
+    .eq('id', id)
+    .eq('business_id', businessId)
+    .single();
+
+  if (customerError || !customer) {
+    return res.status(404).json({ error: 'Customer not found' });
+  }
+
+  // Then: fetch messages
   const { data, error } = await supabase
     .from('messages')
-    .select('id, direction, content, status, created_at')
-    .eq('customer_id', customerId)
-    .order('created_at', { ascending: true });
+    .select('*')
+    .eq('customer_id', id)
+    .order('created_at');
 
   if (error) {
     return res.status(500).json({ error: error.message });
@@ -200,8 +245,11 @@ app.get('/customers/:customerId/messages', async (req, res) => {
 
   res.json(data);
 });
-app.post('/appointments', async (req, res) => {
+
+
+app.post('/appointments', requireAuth, async (req, res) => {
   const { customer_id, service, appointment_time } = req.body;
+  const businessId = req.businessId;
 
   if (!customer_id || !appointment_time) {
     return res.status(400).json({
@@ -209,22 +257,11 @@ app.post('/appointments', async (req, res) => {
     });
   }
 
-  // TEMP: single business
-  const { data: business } = await supabase
-    .from('businesses')
-    .select('*')
-    .limit(1)
-    .single();
-
-  if (!business) {
-    return res.status(404).json({ error: 'Business not found' });
-  }
-
   const { data, error } = await supabase
     .from('appointments')
     .insert([
       {
-        business_id: business.id,
+        business_id: businessId,
         customer_id,
         service,
         appointment_time
@@ -239,17 +276,9 @@ app.post('/appointments', async (req, res) => {
 
   res.json(data);
 });
-app.get('/appointments/upcoming', async (req, res) => {
-  // TEMP: single business
-  const { data: business } = await supabase
-    .from('businesses')
-    .select('*')
-    .limit(1)
-    .single();
 
-  if (!business) {
-    return res.status(404).json({ error: 'Business not found' });
-  }
+app.get('/appointments/upcoming', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
 
   const now = new Date().toISOString();
 
@@ -266,7 +295,7 @@ app.get('/appointments/upcoming', async (req, res) => {
         name
       )
     `)
-    .eq('business_id', business.id)
+    .eq('business_id', businessId)
     .eq('status', 'scheduled')
     .gte('appointment_time', now)
     .order('appointment_time', { ascending: true });
@@ -277,6 +306,7 @@ app.get('/appointments/upcoming', async (req, res) => {
 
   res.json(data);
 });
+
 cron.schedule('* * * * *', async () => {
   try {
     console.log('Running automation rules check...');
@@ -365,22 +395,13 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
-app.get('/automation-rules', async (req, res) => {
-  // TEMP: single business
-  const { data: business } = await supabase
-    .from('businesses')
-    .select('*')
-    .limit(1)
-    .single();
-
-  if (!business) {
-    return res.status(404).json({ error: 'Business not found' });
-  }
+app.get('/automation-rules', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
 
   const { data, error } = await supabase
     .from('automation_rules')
-    .select('id, rule_type, offset_minutes, message_template, enabled')
-    .eq('business_id', business.id)
+    .select('*')
+    .eq('business_id', businessId)
     .order('offset_minutes');
 
   if (error) {
@@ -389,8 +410,10 @@ app.get('/automation-rules', async (req, res) => {
 
   res.json(data);
 });
-app.patch('/automation-rules/:ruleId', async (req, res) => {
+
+app.patch('/automation-rules/:ruleId',requireAuth, async (req, res) => {
   const { ruleId } = req.params;
+  const businessId = req.businessId;
   const { enabled, offset_minutes, message_template } = req.body;
 
   const updates = {};
@@ -407,6 +430,7 @@ app.patch('/automation-rules/:ruleId', async (req, res) => {
     .from('automation_rules')
     .update(updates)
     .eq('id', ruleId)
+    .eq('business_id', businessId)
     .select()
     .single();
 
@@ -416,14 +440,15 @@ app.patch('/automation-rules/:ruleId', async (req, res) => {
 
   res.json(data);
 });
-app.post('/messages/send', async (req, res) => {
+app.post('/messages/send', requireAuth, async (req, res) => {
   const { customer_id, text } = req.body;
+  const businessId = req.businessId;
 
   if (!customer_id || !text) {
     return res.status(400).json({ error: 'customer_id and text are required' });
   }
 
-  // Get customer + phone
+  // 1️⃣ Verify customer belongs to this business
   const { data: customer, error: customerError } = await supabase
     .from('customers')
     .select('id, phone')
@@ -434,15 +459,15 @@ app.post('/messages/send', async (req, res) => {
     return res.status(404).json({ error: 'Customer not found' });
   }
 
-  // Send WhatsApp message
+  // 2️⃣ Send WhatsApp message
   const sendResult = await sendWhatsAppMessage(customer.phone, text);
 
-  // Save outgoing message
+  // 3️⃣ Save outgoing message
   const { data: message, error } = await supabase
     .from('messages')
     .insert([
       {
-        customer_id: customer.id,
+        customer_id,
         direction: 'out',
         content: text,
         status: sendResult.status
