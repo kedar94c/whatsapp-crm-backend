@@ -416,6 +416,47 @@ app.patch('/automation-rules/:ruleId', async (req, res) => {
 
   res.json(data);
 });
+app.post('/messages/send', async (req, res) => {
+  const { customer_id, text } = req.body;
+
+  if (!customer_id || !text) {
+    return res.status(400).json({ error: 'customer_id and text are required' });
+  }
+
+  // Get customer + phone
+  const { data: customer, error: customerError } = await supabase
+    .from('customers')
+    .select('id, phone')
+    .eq('id', customer_id)
+    .single();
+
+  if (customerError || !customer) {
+    return res.status(404).json({ error: 'Customer not found' });
+  }
+
+  // Send WhatsApp message
+  const sendResult = await sendWhatsAppMessage(customer.phone, text);
+
+  // Save outgoing message
+  const { data: message, error } = await supabase
+    .from('messages')
+    .insert([
+      {
+        customer_id: customer.id,
+        direction: 'out',
+        content: text,
+        status: sendResult.status
+      }
+    ])
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json(message);
+});
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on port ${process.env.PORT}`);
