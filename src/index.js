@@ -365,6 +365,57 @@ cron.schedule('* * * * *', async () => {
   }
 });
 
+app.get('/automation-rules', async (req, res) => {
+  // TEMP: single business
+  const { data: business } = await supabase
+    .from('businesses')
+    .select('*')
+    .limit(1)
+    .single();
+
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+
+  const { data, error } = await supabase
+    .from('automation_rules')
+    .select('id, rule_type, offset_minutes, message_template, enabled')
+    .eq('business_id', business.id)
+    .order('offset_minutes');
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json(data);
+});
+app.patch('/automation-rules/:ruleId', async (req, res) => {
+  const { ruleId } = req.params;
+  const { enabled, offset_minutes, message_template } = req.body;
+
+  const updates = {};
+  if (enabled !== undefined) updates.enabled = enabled;
+  if (offset_minutes !== undefined) updates.offset_minutes = offset_minutes;
+  if (message_template !== undefined)
+    updates.message_template = message_template;
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No valid fields to update' });
+  }
+
+  const { data, error } = await supabase
+    .from('automation_rules')
+    .update(updates)
+    .eq('id', ruleId)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json(data);
+});
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on port ${process.env.PORT}`);
