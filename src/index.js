@@ -279,7 +279,7 @@ app.get('/appointments/upcoming', async (req, res) => {
 });
 cron.schedule('* * * * *', async () => {
   try {
-    console.log('Running reminder check...');
+    console.log('Running automation rules check...');
 
     // TEMP: single business
     const { data: business } = await supabase
@@ -290,51 +290,81 @@ cron.schedule('* * * * *', async () => {
 
     if (!business) return;
 
-    // Time window: 24h ± 1 min
-    const now = new Date();
-    const from = new Date(now.getTime() + 23 * 60 * 60 * 1000);
-    const to = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-    const { data: appointments, error } = await supabase
-      .from('appointments')
-      .select(`
-        id,
-        appointment_time,
-        service,
-        reminder_24h_sent,
-        customers (
-          phone
-        )
-      `)
+    // Get enabled rules
+    const { data: rules } = await supabase
+      .from('automation_rules')
+      .select('*')
       .eq('business_id', business.id)
-      .eq('status', 'scheduled')
-      .eq('reminder_24h_sent', false)
-      .gte('appointment_time', from.toISOString())
-      .lte('appointment_time', to.toISOString());
+      .eq('enabled', true);
 
-    if (error || !appointments?.length) return;
+    if (!rules?.length) return;
 
-    for (const appt of appointments) {
-      const reminderText = `Reminder: You have an appointment tomorrow for ${appt.service}. Please reply if you need to reschedule.`;
+    const now = new Date();
 
-      const sendResult = await sendWhatsAppMessage(
-        appt.customers.phone,
-        reminderText
+    for (const rule of rules) {
+      const from = new Date(
+        now.getTime() + (rule.offset_minutes - 1) * 60 * 1000
+      );
+      const to = new Date(
+        now.getTime() + rule.offset_minutes * 60 * 1000
       );
 
-      if (sendResult.status === 'submitted') {
-        await supabase
-          .from('appointments')
-          .update({ reminder_24h_sent: true })
-          .eq('id', appt.id);
+      const { data: appointments } = await supabase
+        .from('appointments')
+        .select(`
+          id,
+          service,
+          appointment_time,
+          customers ( phone )
+        `)
+        .eq('business_id', business.id)
+        .eq('status', 'scheduled')
+        .gte('appointment_time', from.toISOString())
+        .lte('appointment_time', to.toISOString());
 
-        console.log(`24h reminder sent for appointment ${appt.id}`);
+      if (!appointments?.length) continue;
+
+      for (const appt of appointments) {
+        // Check if this rule already fired
+        const { data: alreadySent } = await supabase
+          .from('automation_logs')
+          .select('id')
+          .eq('appointment_id', appt.id)
+          .eq('rule_id', rule.id)
+          .maybeSingle();
+
+        if (alreadySent) continue;
+
+        // Build message
+        const message = rule.message_template.replace(
+          '{{service}}',
+          appt.service || 'your service'
+        );
+
+        const sendResult = await sendWhatsAppMessage(
+          appt.customers.phone,
+          message
+        );
+
+        if (sendResult.status === 'submitted') {
+          await supabase.from('automation_logs').insert([
+            {
+              appointment_id: appt.id,
+              rule_id: rule.id
+            }
+          ]);
+
+          console.log(
+            `Rule ${rule.id} executed for appointment ${appt.id}`
+          );
+        }
       }
     }
   } catch (err) {
-    console.error('Reminder cron error:', err.message);
+    console.error('Automation cron error:', err.message);
   }
 });
+
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on port ${process.env.PORT}`);
