@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 import cron from 'node-cron';
+import { DateTime } from 'luxon';
 
 dotenv.config();
 
@@ -56,7 +57,7 @@ async function requireAuth(req, res, next) {
     return res.status(500).json({ error: err.message });
   }
 }
-
+  
 async function sendWhatsAppMessage(phone, text) {
   try {
     const params = new URLSearchParams();
@@ -247,6 +248,8 @@ app.get('/customers/:id/messages', requireAuth, async (req, res) => {
 });
 
 
+import { fromZonedTime } from 'date-fns-tz';
+
 app.post('/appointments', requireAuth, async (req, res) => {
   const { customer_id, service, appointment_time } = req.body;
   const businessId = req.businessId;
@@ -257,25 +260,46 @@ app.post('/appointments', requireAuth, async (req, res) => {
     });
   }
 
-  const { data, error } = await supabase
-    .from('appointments')
-    .insert([
-      {
-        business_id: businessId,
-        customer_id,
-        service,
-        appointment_time
-      }
-    ])
-    .select()
-    .single();
+  try {
+    // 1️⃣ Fetch business timezone
+    const { data: business, error: bizError } = await supabase
+      .from('businesses')
+      .select('timezone')
+      .eq('id', businessId)
+      .single();
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
+    if (bizError || !business?.timezone) {
+      return res.status(500).json({ error: 'Business timezone not found' });
+    }
+
+    // 2️⃣ Convert business time to UTC
+    const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
+    const utcTime = zonedTime.toUTC().toISO({ includeOffset: false });
+    console.log('UTC Time with milliseconds:', utcTime);
+    // 3️⃣ Insert with UTC time
+    const { data, error } = await supabase
+      .from('appointments')
+      .insert([
+        {
+          business_id: businessId,
+          customer_id,
+          service,
+          appointment_time: utcTime
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true, appointment_time: utcTime });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
-
-  res.json(data);
 });
+// ...existing code...
 
 app.get('/appointments/upcoming', requireAuth, async (req, res) => {
   const businessId = req.businessId;
@@ -311,82 +335,85 @@ cron.schedule('* * * * *', async () => {
   try {
     console.log('Running automation rules check...');
 
-    // TEMP: single business
-    const { data: business } = await supabase
+    // Get ALL businesses
+    const { data: businesses } = await supabase
       .from('businesses')
-      .select('*')
-      .limit(1)
-      .single();
+      .select('*');
 
-    if (!business) return;
+    if (!businesses?.length) return;
 
-    // Get enabled rules
-    const { data: rules } = await supabase
-      .from('automation_rules')
-      .select('*')
-      .eq('business_id', business.id)
-      .eq('enabled', true);
-
-    if (!rules?.length) return;
-
-    const now = new Date();
-
-    for (const rule of rules) {
-      const from = new Date(
-        now.getTime() + (rule.offset_minutes - 1) * 60 * 1000
-      );
-      const to = new Date(
-        now.getTime() + rule.offset_minutes * 60 * 1000
-      );
-
-      const { data: appointments } = await supabase
-        .from('appointments')
-        .select(`
-          id,
-          service,
-          appointment_time,
-          customers ( phone )
-        `)
+    // Loop through each business
+    for (const business of businesses) {
+      // Get enabled rules for this business
+      const { data: rules } = await supabase
+        .from('automation_rules')
+        .select('*')
         .eq('business_id', business.id)
-        .eq('status', 'scheduled')
-        .gte('appointment_time', from.toISOString())
-        .lte('appointment_time', to.toISOString());
+        .eq('enabled', true);
 
-      if (!appointments?.length) continue;
+      if (!rules?.length) continue;
 
-      for (const appt of appointments) {
-        // Check if this rule already fired
-        const { data: alreadySent } = await supabase
-          .from('automation_logs')
-          .select('id')
-          .eq('appointment_id', appt.id)
-          .eq('rule_id', rule.id)
-          .maybeSingle();
+      // Use Luxon instead of Date
+      const now = DateTime.now().toUTC();
 
-        if (alreadySent) continue;
+      for (const rule of rules) {
+        // Calculate time windows using Luxon
+        const from = now.plus({ minutes: rule.offset_minutes - 1 });
+        const to = now.plus({ minutes: rule.offset_minutes });
 
-        // Build message
-        const message = rule.message_template.replace(
-          '{{service}}',
-          appt.service || 'your service'
-        );
+        const { data: appointments } = await supabase
+          .from('appointments')
+          .select(`
+            id,
+            service,
+            appointment_time,
+            customers ( phone )
+          `)
+          .eq('business_id', business.id)
+          .eq('status', 'scheduled')
+          .gte('appointment_time', from.toISO())
+          .lte('appointment_time', to.toISO());
 
-        const sendResult = await sendWhatsAppMessage(
-          appt.customers.phone,
-          message
-        );
+        if (!appointments?.length) continue;
 
-        if (sendResult.status === 'submitted') {
-          await supabase.from('automation_logs').insert([
-            {
-              appointment_id: appt.id,
-              rule_id: rule.id
-            }
-          ]);
+        for (const appt of appointments) {
+          // Check if this rule already fired
+          const { data: alreadySent } = await supabase
+            .from('automation_logs')
+            .select('id')
+            .eq('appointment_id', appt.id)
+            .eq('rule_id', rule.id)
+            .maybeSingle();
 
-          console.log(
-            `Rule ${rule.id} executed for appointment ${appt.id}`
+          if (alreadySent) continue;
+
+          // Convert UTC appointment time to business timezone
+          const appointmentDateTime = DateTime.fromISO(appt.appointment_time, { zone: 'UTC' });
+          const businessTz = business.timezone || 'UTC';
+          const localTime = appointmentDateTime.setZone(businessTz).toFormat('yyyy-MM-dd hh:mm a');
+
+          // Build message
+          let message = rule.message_template
+            .replace('{{service}}', appt.service || 'your service')
+            .replace('{{appointment_time}}', localTime);
+
+          const sendResult = await sendWhatsAppMessage(
+            appt.customers.phone,
+            message
           );
+
+          if (sendResult.status === 'submitted') {
+            await supabase.from('automation_logs').insert([
+              {
+                appointment_id: appt.id,
+                rule_id: rule.id
+              }
+            ]);
+
+            console.log(
+              `Rule ${rule.id} executed for appointment ${appt.id} (Business: ${business.id})`
+            );
+          }
         }
       }
     }
@@ -394,6 +421,7 @@ cron.schedule('* * * * *', async () => {
     console.error('Automation cron error:', err.message);
   }
 });
+// ...existing code...
 
 app.get('/automation-rules', requireAuth, async (req, res) => {
   const businessId = req.businessId;
@@ -441,6 +469,8 @@ app.patch('/automation-rules/:ruleId',requireAuth, async (req, res) => {
   res.json(data);
 });
 app.post('/messages/send', requireAuth, async (req, res) => {
+  console.log('SEND BODY:', req.body);
+  console.log('BUSINESS ID:', req.businessId);
   const { customer_id, text } = req.body;
   const businessId = req.businessId;
 
@@ -453,35 +483,95 @@ app.post('/messages/send', requireAuth, async (req, res) => {
     .from('customers')
     .select('id, phone')
     .eq('id', customer_id)
+    .eq('business_id', businessId)
     .single();
 
   if (customerError || !customer) {
     return res.status(404).json({ error: 'Customer not found' });
   }
+// 1️⃣ Insert message first
+const { data: message, error: insertError } = await supabase
+  .from('messages')
+  .insert([
+    {
+      customer_id,
+      direction: 'out',
+      content: text,
+      status: 'pending'
+    }
+  ])
+  .select()
+  .single();
 
-  // 2️⃣ Send WhatsApp message
+if (insertError) {
+  return res.status(500).json({ error: insertError.message });
+}
+
+// 2️⃣ Try sending WhatsApp
+try {
   const sendResult = await sendWhatsAppMessage(customer.phone, text);
 
-  // 3️⃣ Save outgoing message
-  const { data: message, error } = await supabase
+  // 3️⃣ Mark as sent
+  await supabase
     .from('messages')
-    .insert([
-      {
-        customer_id,
-        direction: 'out',
-        content: text,
-        status: sendResult.status
-      }
-    ])
-    .select()
-    .single();
+    .update({
+      status: 'sent'
+    })
+    .eq('id', message.id);
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
+  res.json({ ...message, status: 'sent' });
 
-  res.json(message);
+} catch (err) {
+  // 4️⃣ Mark as failed
+  await supabase
+    .from('messages')
+    .update({
+      status: 'failed',
+      error: err.message,
+      retry_count: 1
+    })
+    .eq('id', message.id);
+
+  res.json({ ...message, status: 'failed' });
+}
+
 });
+async function retryFailedMessages() {
+  const { data: messages } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('status', 'failed')
+    .lt('retry_count', 3)
+    .limit(10);
+
+  for (const msg of messages || []) {
+    try {
+      await supabase
+        .from('messages')
+        .update({ status: 'retrying' })
+        .eq('id', msg.id);
+
+      const customer = await getCustomerPhone(msg.customer_id);
+      await sendWhatsAppMessage(customer.phone, msg.content);
+
+      await supabase
+        .from('messages')
+        .update({ status: 'sent' })
+        .eq('id', msg.id);
+
+    } catch (err) {
+      await supabase
+        .from('messages')
+        .update({
+          status: 'failed',
+          retry_count: msg.retry_count + 1,
+          error: err.message
+        })
+        .eq('id', msg.id);
+    }
+  }
+}
+setInterval(retryFailedMessages, 5 * 60 * 1000);
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on port ${process.env.PORT}`);
