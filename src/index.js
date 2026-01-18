@@ -57,7 +57,32 @@ async function requireAuth(req, res, next) {
     return res.status(500).json({ error: err.message });
   }
 }
-  
+ 
+app.get('/me', requireAuth, async (req, res) => {
+  try {
+    const { data: business, error } = await supabase
+      .from('businesses')
+      .select('id, name, timezone')
+      .eq('id', req.businessId)
+      .single();
+
+    if (error || !business) {
+      return res.status(404).json({ error: 'Business not found' });
+    }
+
+    res.json({
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        role: req.role,
+      },
+      business,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function sendWhatsAppMessage(phone, text) {
   try {
     const params = new URLSearchParams();
