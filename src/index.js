@@ -298,9 +298,8 @@ app.post('/appointments', requireAuth, async (req, res) => {
     }
 
     // 2️⃣ Convert business time to UTC
-    const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
-    const utcTime = zonedTime.toUTC().toISO({ includeOffset: false });
-    console.log('UTC Time with milliseconds:', utcTime);
+     const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
+     const utcTime = zonedTime.toUTC().toISO(); // <-- includes Z
     // 3️⃣ Insert with UTC time
     const { data, error } = await supabase
       .from('appointments')
@@ -352,6 +351,40 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
   if (error) {
     return res.status(500).json({ error: error.message });
   }
+
+  res.json(data);
+});
+
+app.get('/appointments/next', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+  const { customerId } = req.query;
+  
+  if (!customerId) {
+    return res.status(400).json({ error: 'customerId is required' });
+  }
+
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from('appointments')
+    .select(`
+      id,
+      service,
+      appointment_time,
+      status
+    `)
+    .eq('business_id', businessId)
+    .eq('customer_id', customerId)
+    .eq('status', 'scheduled')
+    .gte('appointment_time', now)
+    .order('appointment_time', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
 
   res.json(data);
 });
@@ -494,8 +527,6 @@ app.patch('/automation-rules/:ruleId',requireAuth, async (req, res) => {
   res.json(data);
 });
 app.post('/messages/send', requireAuth, async (req, res) => {
-  console.log('SEND BODY:', req.body);
-  console.log('BUSINESS ID:', req.businessId);
   const { customer_id, text } = req.body;
   const businessId = req.businessId;
 
