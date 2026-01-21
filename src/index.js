@@ -389,6 +389,54 @@ app.get('/appointments/next', requireAuth, async (req, res) => {
   res.json(data);
 });
 
+app.get('/appointments', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+  try {
+    const { data, error } = await supabase
+      .from('appointments')
+      .select(`
+        id,
+        customer_id,
+        service,
+        appointment_time,
+        status,
+        customers (
+          id,
+          name,
+          phone
+        )
+      `)
+      .eq('business_id', businessId)
+      .order('status', {
+        ascending: true,
+        foreignTable: undefined
+      })
+      .order('appointment_time', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Reorder in-memory to ensure:
+    // 1. scheduled first
+    // 2. past later
+    const upcoming = [];
+    const past = [];
+
+    for (const appt of data) {
+      if (appt.status === 'scheduled') {
+        upcoming.push(appt);
+      } else {
+        past.push(appt);
+      }
+    }
+
+    res.json([...upcoming, ...past]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 cron.schedule('* * * * *', async () => {
   try {
     console.log('Running automation rules check...');
@@ -479,7 +527,179 @@ cron.schedule('* * * * *', async () => {
     console.error('Automation cron error:', err.message);
   }
 });
-// ...existing code...
+
+async function autoMarkNoShows() {
+  try {
+    const GRACE_MINUTES = 30;
+
+    const cutoff = DateTime.now()
+      .toUTC()
+      .minus({ minutes: GRACE_MINUTES })
+      .toISO();
+
+    // Find overdue scheduled appointments
+    const { data: appointments, error } = await supabase
+      .from('appointments')
+      .select('id, appointment_time')
+      .eq('status', 'scheduled')
+      .lt('appointment_time', cutoff);
+
+    if (error) {
+      console.error('Auto no-show fetch error:', error.message);
+      return;
+    }
+
+    if (!appointments || appointments.length === 0) {
+      return;
+    }
+
+    const ids = appointments.map(a => a.id);
+
+    const { error: updateError } = await supabase
+      .from('appointments')
+      .update({
+        status: 'no_show'
+      })
+      .in('id', ids);
+
+    if (updateError) {
+      console.error('Auto no-show update error:', updateError.message);
+      return;
+    }
+
+    console.log(
+      `Auto-marked ${ids.length} appointment(s) as no_show`
+    );
+  } catch (err) {
+    console.error('Auto no-show cron error:', err.message);
+  }
+}
+
+cron.schedule('* * * * *', autoMarkNoShows);
+
+//
+
+app.patch('/appointments/:id/status', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+  const { id } = req.params;
+  const { status } = req.body;
+
+  const allowedStatuses = ['completed', 'no_show', 'cancelled'];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      error: 'Invalid status'
+    });
+  }
+
+  try {
+    // Ensure appointment belongs to this business
+    const { data: appointment, error: fetchError } = await supabase
+      .from('appointments')
+      .select('id, status')
+      .eq('id', id)
+      .eq('business_id', businessId)
+      .single();
+
+    if (fetchError || !appointment) {
+      return res.status(404).json({
+        error: 'Appointment not found'
+      });
+    }
+
+    // Update status explicitly
+    const { data, error } = await supabase
+      .from('appointments')
+      .update({ status })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.patch('/appointments/:id/reschedule', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+  const { id } = req.params;
+  const { appointment_time } = req.body;
+
+  if (!appointment_time) {
+    return res.status(400).json({
+      error: 'appointment_time is required'
+    });
+  }
+
+  try {
+    // 1️⃣ Fetch business timezone
+    const { data: business, error: bizError } = await supabase
+      .from('businesses')
+      .select('timezone')
+      .eq('id', businessId)
+      .single();
+
+    if (bizError || !business?.timezone) {
+      return res.status(500).json({
+        error: 'Business timezone not found'
+      });
+    }
+
+    // 2️⃣ Ensure appointment belongs to this business
+    const { data: appointment, error: fetchError } = await supabase
+      .from('appointments')
+      .select('id')
+      .eq('id', id)
+      .eq('business_id', businessId)
+      .single();
+
+    if (fetchError || !appointment) {
+      return res.status(404).json({
+        error: 'Appointment not found'
+      });
+    }
+
+    // 3️⃣ Convert business-local time → UTC
+    const zonedTime = DateTime.fromISO(appointment_time, {
+      zone: business.timezone
+    });
+
+    if (!zonedTime.isValid) {
+      return res.status(400).json({
+        error: 'Invalid appointment_time'
+      });
+    }
+
+    const utcTime = zonedTime.toUTC().toISO();
+    // 🔥 Clear old automation logs so reminders can fire again
+await supabase
+  .from('automation_logs')
+  .delete()
+  .eq('appointment_id', id);
+    // 4️⃣ Update appointment
+    const { data, error } = await supabase
+      .from('appointments')
+      .update({
+        appointment_time: utcTime,
+        status: 'scheduled'
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/automation-rules', requireAuth, async (req, res) => {
   const businessId = req.businessId;
