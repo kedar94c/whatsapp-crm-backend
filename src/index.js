@@ -299,7 +299,16 @@ app.post('/appointments', requireAuth, async (req, res) => {
 
     // 2️⃣ Convert business time to UTC
      const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
-     const utcTime = zonedTime.toUTC().toISO(); // <-- includes Z
+     const utcDateTime = zonedTime.toUTC();
+
+if (utcDateTime < DateTime.now().toUTC()) {
+  return res.status(400).json({
+    error: 'Appointment time cannot be in the past'
+  });
+}
+
+const utcTime = utcDateTime.toISO();
+
     // 3️⃣ Insert with UTC time
     const { data, error } = await supabase
       .from('appointments')
@@ -346,7 +355,9 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
     .eq('business_id', businessId)
     .eq('status', 'scheduled')
     .gte('appointment_time', now)
-    .order('appointment_time', { ascending: true });
+    .order('appointment_time', { ascending: true })
+    .is('archived_at', null);
+    
 
   if (error) {
     return res.status(500).json({ error: error.message });
@@ -577,6 +588,31 @@ async function autoMarkNoShows() {
 
 cron.schedule('* * * * *', autoMarkNoShows);
 
+cron.schedule('0 3 * * *', async () => {
+  // runs daily at 3 AM server time
+  try {
+    console.log('Archiving old cancelled / no-show appointments');
+
+    const cutoff = DateTime.now()
+      .minus({ days: 5 })
+      .toUTC()
+      .toISO();
+
+    const { error } = await supabase
+      .from('appointments')
+      .update({ archived_at: new Date().toISOString() })
+      .in('status', ['cancelled', 'no_show'])
+      .lt('appointment_time', cutoff)
+      .is('archived_at', null);
+
+    if (error) {
+      console.error('Archive cron error:', error.message);
+    }
+  } catch (err) {
+    console.error('Archive cron crash:', err.message);
+  }
+});
+
 //
 
 app.patch('/appointments/:id/status', requireAuth, async (req, res) => {
@@ -673,8 +709,18 @@ app.patch('/appointments/:id/reschedule', requireAuth, async (req, res) => {
         error: 'Invalid appointment_time'
       });
     }
+const newUtc = DateTime.fromISO(appointment_time, {
+  zone: business.timezone
+}).toUTC();
+
+if (newUtc < DateTime.now().toUTC()) {
+  return res.status(400).json({
+    error: 'Rescheduled time cannot be in the past'
+  });
+}
 
     const utcTime = zonedTime.toUTC().toISO();
+
     // 🔥 Clear old automation logs so reminders can fire again
 await supabase
   .from('automation_logs')
