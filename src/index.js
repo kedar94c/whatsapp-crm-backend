@@ -150,17 +150,29 @@ app.post('/businesses', async (req, res) => {
 
   res.json(data);
 });
+
 app.post('/webhook/whatsapp', async (req, res) => {
   try {
-    const phone = req.body?.sender?.phone;
-    const text = req.body?.message?.text;
+    const eventType = req.body?.type;
 
-    if (!phone || !text) {
-      console.log('Invalid webhook payload');
+    // Only process incoming messages
+    if (eventType !== 'message') {
       return res.sendStatus(200);
     }
 
-    // 1️⃣ Get first business (TEMP)
+    const payload = req.body.payload;
+
+    const phone = payload?.sender?.phone;
+    const text = payload?.payload?.text;
+
+    if (!phone || !text) {
+      console.log('Ignored webhook (no text / phone)');
+      return res.sendStatus(200);
+    }
+
+    console.log(`📩 Incoming WhatsApp from ${phone}: ${text}`);
+
+    // 1️⃣ Get business (TEMP: first business)
     const { data: business, error: bizError } = await supabase
       .from('businesses')
       .select('*')
@@ -203,36 +215,27 @@ app.post('/webhook/whatsapp', async (req, res) => {
         content: text
       }
     ]);
-    console.log(`Message saved from ${phone}: ${text}`);
+
+    console.log('✅ Message stored successfully');
+
     res.sendStatus(200);
-       // 4️⃣ Send auto-reply (TEMP)
-    const replyText = 'Thanks for contacting us! We will get back to you shortly.';
-const sendResult = await sendWhatsAppMessage(phone, replyText);
-
-// Save outgoing message
-await supabase.from('messages').insert([
-  {
-    customer_id: customer.id,
-    direction: 'out',
-    content: replyText,
-    status: sendResult.status
+  } catch (err) {
+    console.error('Webhook processing error:', err);
+    res.sendStatus(200); // always 200 for WhatsApp
   }
-]);
-
-  } catch (error) {
-  console.error('Gupshup error status:', error.response?.status);
-  console.error('Gupshup error data:', error.response?.data);
-  console.error('Gupshup error headers:', error.response?.headers);
-  }
-
 });
+
 app.get('/customers', requireAuth, async (req, res) => {
   const businessId = req.businessId;
 
   const { data, error } = await supabase.rpc(
-    'get_customers_with_last_message',
-    { business_uuid: businessId }
-  );
+  'get_customers_with_last_message',
+  {
+    business_uuid: businessId,
+    user_uuid: req.user.id,
+  }
+);
+
 
   if (error) {
     return res.status(500).json({ error: error.message });
@@ -332,7 +335,39 @@ const utcTime = utcDateTime.toISO();
     return res.status(400).json({ error: err.message });
   }
 });
-// ...existing code...
+
+app.post('/conversations/read', requireAuth, async (req, res) => {
+  const { customer_id } = req.body;
+
+  if (!customer_id) {
+    return res.status(400).json({ error: 'customer_id is required' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('conversation_reads')
+      .upsert(
+        {
+          business_id: req.businessId,
+          customer_id,
+          user_id: req.user.id,
+          last_read_at: new Date().toISOString(),
+        },
+        {
+          onConflict: 'business_id,customer_id,user_id',
+        }
+      );
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 app.get('/appointments/upcoming', requireAuth, async (req, res) => {
   const businessId = req.businessId;
