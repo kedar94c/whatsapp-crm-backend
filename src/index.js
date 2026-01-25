@@ -57,12 +57,12 @@ async function requireAuth(req, res, next) {
     return res.status(500).json({ error: err.message });
   }
 }
- 
+
 app.get('/me', requireAuth, async (req, res) => {
   try {
     const { data: business, error } = await supabase
       .from('businesses')
-      .select('id, name, timezone')
+      .select('id, name, timezone, appointment_settings')
       .eq('id', req.businessId)
       .single();
 
@@ -229,12 +229,12 @@ app.get('/customers', requireAuth, async (req, res) => {
   const businessId = req.businessId;
 
   const { data, error } = await supabase.rpc(
-  'get_customers_with_last_message',
-  {
-    business_uuid: businessId,
-    user_uuid: req.user.id,
-  }
-);
+    'get_customers_with_last_message',
+    {
+      business_uuid: businessId,
+      user_uuid: req.user.id,
+    }
+  );
 
 
   if (error) {
@@ -301,16 +301,16 @@ app.post('/appointments', requireAuth, async (req, res) => {
     }
 
     // 2️⃣ Convert business time to UTC
-     const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
-     const utcDateTime = zonedTime.toUTC();
+    const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
+    const utcDateTime = zonedTime.toUTC();
 
-if (utcDateTime < DateTime.now().toUTC()) {
-  return res.status(400).json({
-    error: 'Appointment time cannot be in the past'
-  });
-}
+    if (utcDateTime < DateTime.now().toUTC()) {
+      return res.status(400).json({
+        error: 'Appointment time cannot be in the past'
+      });
+    }
 
-const utcTime = utcDateTime.toISO();
+    const utcTime = utcDateTime.toISO();
 
     // 3️⃣ Insert with UTC time
     const { data, error } = await supabase
@@ -392,7 +392,7 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
     .gte('appointment_time', now)
     .order('appointment_time', { ascending: true })
     .is('archived_at', null);
-    
+
 
   if (error) {
     return res.status(500).json({ error: error.message });
@@ -404,7 +404,7 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
 app.get('/appointments/next', requireAuth, async (req, res) => {
   const businessId = req.businessId;
   const { customerId } = req.query;
-  
+
   if (!customerId) {
     return res.status(400).json({ error: 'customerId is required' });
   }
@@ -576,50 +576,67 @@ cron.schedule('* * * * *', async () => {
 
 async function autoMarkNoShows() {
   try {
-    const GRACE_MINUTES = 30;
+    const now = DateTime.now().toUTC();
 
-    const cutoff = DateTime.now()
-      .toUTC()
-      .minus({ minutes: GRACE_MINUTES })
-      .toISO();
+    // 1️⃣ Get businesses with their no-show grace settings
+    const { data: businesses, error: bizError } = await supabase
+      .from('businesses')
+      .select('id, appointment_settings');
 
-    // Find overdue scheduled appointments
-    const { data: appointments, error } = await supabase
-      .from('appointments')
-      .select('id, appointment_time')
-      .eq('status', 'scheduled')
-      .lt('appointment_time', cutoff);
-
-    if (error) {
-      console.error('Auto no-show fetch error:', error.message);
+    if (bizError || !businesses?.length) {
+      console.error('Failed to load businesses for no-show check');
       return;
     }
 
-    if (!appointments || appointments.length === 0) {
-      return;
+    for (const business of businesses) {
+      const graceMinutes =
+        business.appointment_settings?.no_show_grace_minutes ?? 30;
+
+      // 2️⃣ Get scheduled appointments for this business
+      const { data: appointments, error: apptError } = await supabase
+        .from('appointments')
+        .select('id, appointment_time')
+        .eq('business_id', business.id)
+        .eq('status', 'scheduled');
+
+      if (apptError || !appointments?.length) continue;
+
+      // 3️⃣ Find overdue appointments
+      const overdueIds = appointments
+        .filter(appt => {
+          const apptTime = DateTime.fromISO(appt.appointment_time, {
+            zone: 'UTC',
+          });
+          const noShowAt = apptTime.plus({ minutes: graceMinutes });
+
+          return now > noShowAt;
+        })
+        .map(a => a.id);
+
+      if (overdueIds.length === 0) continue;
+
+      // 4️⃣ Mark them as no-show
+      const { error: updateError } = await supabase
+        .from('appointments')
+        .update({ status: 'no_show' })
+        .in('id', overdueIds);
+
+      if (updateError) {
+        console.error(
+          `No-show update failed for business ${business.id}`,
+          updateError.message
+        );
+      } else {
+        console.log(
+          `Auto-marked ${overdueIds.length} appointment(s) as no_show for business ${business.id}`
+        );
+      }
     }
-
-    const ids = appointments.map(a => a.id);
-
-    const { error: updateError } = await supabase
-      .from('appointments')
-      .update({
-        status: 'no_show'
-      })
-      .in('id', ids);
-
-    if (updateError) {
-      console.error('Auto no-show update error:', updateError.message);
-      return;
-    }
-
-    console.log(
-      `Auto-marked ${ids.length} appointment(s) as no_show`
-    );
   } catch (err) {
     console.error('Auto no-show cron error:', err.message);
   }
 }
+
 
 cron.schedule('* * * * *', autoMarkNoShows);
 
@@ -695,6 +712,69 @@ app.patch('/appointments/:id/status', requireAuth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+
+  // 🔒 Owner-only
+  if (req.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owner can update settings' });
+  }
+
+  const {
+    reminder_24h,
+    reminder_2h,
+    no_show_grace_minutes,
+    default_duration_minutes,
+  } = req.body;
+
+  // Basic validation
+  if (
+    typeof reminder_24h !== 'boolean' ||
+    typeof reminder_2h !== 'boolean' ||
+    typeof no_show_grace_minutes !== 'number' ||
+    typeof default_duration_minutes !== 'number'
+  ) {
+    return res.status(400).json({ error: 'Invalid settings payload' });
+  }
+
+  const { data, error } = await supabase
+    .from('businesses')
+    .update({
+      appointment_settings: {
+        reminder_24h,
+        reminder_2h,
+        no_show_grace_minutes,
+        default_duration_minutes,
+      },
+    })
+    .eq('id', businessId)
+    .select('appointment_settings')
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+/* 🔄 SYNC REMINDER SETTINGS → AUTOMATION RULES */
+
+// 24h reminder
+await supabase
+  .from('automation_rules')
+  .update({ enabled: reminder_24h })
+  .eq('business_id', businessId)
+  .eq('rule_type', 'reminder_24h');
+
+// 2h reminder
+await supabase
+  .from('automation_rules')
+  .update({ enabled: reminder_2h })
+  .eq('business_id', businessId)
+  .eq('rule_type', 'reminder_2h');
+
+  res.json(data.appointment_settings);
+});
+
+
 app.patch('/appointments/:id/reschedule', requireAuth, async (req, res) => {
   const businessId = req.businessId;
   const { id } = req.params;
@@ -744,23 +824,23 @@ app.patch('/appointments/:id/reschedule', requireAuth, async (req, res) => {
         error: 'Invalid appointment_time'
       });
     }
-const newUtc = DateTime.fromISO(appointment_time, {
-  zone: business.timezone
-}).toUTC();
+    const newUtc = DateTime.fromISO(appointment_time, {
+      zone: business.timezone
+    }).toUTC();
 
-if (newUtc < DateTime.now().toUTC()) {
-  return res.status(400).json({
-    error: 'Rescheduled time cannot be in the past'
-  });
-}
+    if (newUtc < DateTime.now().toUTC()) {
+      return res.status(400).json({
+        error: 'Rescheduled time cannot be in the past'
+      });
+    }
 
     const utcTime = zonedTime.toUTC().toISO();
 
     // 🔥 Clear old automation logs so reminders can fire again
-await supabase
-  .from('automation_logs')
-  .delete()
-  .eq('appointment_id', id);
+    await supabase
+      .from('automation_logs')
+      .delete()
+      .eq('appointment_id', id);
     // 4️⃣ Update appointment
     const { data, error } = await supabase
       .from('appointments')
@@ -798,7 +878,7 @@ app.get('/automation-rules', requireAuth, async (req, res) => {
   res.json(data);
 });
 
-app.patch('/automation-rules/:ruleId',requireAuth, async (req, res) => {
+app.patch('/automation-rules/:ruleId', requireAuth, async (req, res) => {
   const { ruleId } = req.params;
   const businessId = req.businessId;
   const { enabled, offset_minutes, message_template } = req.body;
@@ -846,51 +926,51 @@ app.post('/messages/send', requireAuth, async (req, res) => {
   if (customerError || !customer) {
     return res.status(404).json({ error: 'Customer not found' });
   }
-// 1️⃣ Insert message first
-const { data: message, error: insertError } = await supabase
-  .from('messages')
-  .insert([
-    {
-      customer_id,
-      direction: 'out',
-      content: text,
-      status: 'pending'
-    }
-  ])
-  .select()
-  .single();
-
-if (insertError) {
-  return res.status(500).json({ error: insertError.message });
-}
-
-// 2️⃣ Try sending WhatsApp
-try {
-  const sendResult = await sendWhatsAppMessage(customer.phone, text);
-
-  // 3️⃣ Mark as sent
-  await supabase
+  // 1️⃣ Insert message first
+  const { data: message, error: insertError } = await supabase
     .from('messages')
-    .update({
-      status: 'sent'
-    })
-    .eq('id', message.id);
+    .insert([
+      {
+        customer_id,
+        direction: 'out',
+        content: text,
+        status: 'pending'
+      }
+    ])
+    .select()
+    .single();
 
-  res.json({ ...message, status: 'sent' });
+  if (insertError) {
+    return res.status(500).json({ error: insertError.message });
+  }
 
-} catch (err) {
-  // 4️⃣ Mark as failed
-  await supabase
-    .from('messages')
-    .update({
-      status: 'failed',
-      error: err.message,
-      retry_count: 1
-    })
-    .eq('id', message.id);
+  // 2️⃣ Try sending WhatsApp
+  try {
+    const sendResult = await sendWhatsAppMessage(customer.phone, text);
 
-  res.json({ ...message, status: 'failed' });
-}
+    // 3️⃣ Mark as sent
+    await supabase
+      .from('messages')
+      .update({
+        status: 'sent'
+      })
+      .eq('id', message.id);
+
+    res.json({ ...message, status: 'sent' });
+
+  } catch (err) {
+    // 4️⃣ Mark as failed
+    await supabase
+      .from('messages')
+      .update({
+        status: 'failed',
+        error: err.message,
+        retry_count: 1
+      })
+      .eq('id', message.id);
+
+    res.json({ ...message, status: 'failed' });
+  }
 
 });
 async function retryFailedMessages() {
