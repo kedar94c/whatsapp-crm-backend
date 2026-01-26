@@ -279,62 +279,135 @@ app.get('/customers/:id/messages', requireAuth, async (req, res) => {
 import { fromZonedTime } from 'date-fns-tz';
 
 app.post('/appointments', requireAuth, async (req, res) => {
-  const { customer_id, service, appointment_time } = req.body;
-  const businessId = req.businessId;
-
-  if (!customer_id || !appointment_time) {
-    return res.status(400).json({
-      error: 'customer_id and appointment_time are required'
-    });
-  }
-
   try {
-    // 1️⃣ Fetch business timezone
+    console.log("CREATE APPOINTMENT payload:", req.body);
+
+    const businessId = req.businessId;
+
+    const {
+      phone,
+      name,
+      service,
+      duration_minutes,
+      appointment_utc_time,
+    } = req.body;
+
+    if (!phone || !appointment_utc_time || !duration_minutes) {
+      return res.status(400).json({ error: 'Invalid appointment payload' });
+    }
+
+    /* --------------------------------------------------
+       1️⃣ Find or create customer
+    -------------------------------------------------- */
+
+    let { data: customer } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('business_id', businessId)
+      .eq('phone', phone)
+      .single();
+
+    if (!customer) {
+      const { data: created, error } = await supabase
+        .from('customers')
+        .insert({
+          business_id: businessId,
+          phone,
+          name: name || null,
+        })
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+
+      customer = created;
+    } else if (!customer.name && name) {
+      // backfill name if missing
+      await supabase
+        .from('customers')
+        .update({ name })
+        .eq('id', customer.id);
+    }
+
+    /* --------------------------------------------------
+       2️⃣ Calculate slot minutes (UTC)
+    -------------------------------------------------- */
+
+    const appointmentDate = new Date(appointment_utc_time);
+    const slot_minutes =
+      appointmentDate.getUTCHours() * 60 +
+      appointmentDate.getUTCMinutes();
+
+    /* --------------------------------------------------
+       3️⃣ Fetch business appointment settings
+    -------------------------------------------------- */
+
     const { data: business, error: bizError } = await supabase
       .from('businesses')
-      .select('timezone')
+      .select('appointment_settings')
       .eq('id', businessId)
       .single();
 
-    if (bizError || !business?.timezone) {
-      return res.status(500).json({ error: 'Business timezone not found' });
+    if (bizError) {
+      return res.status(500).json({ error: bizError.message });
     }
 
-    // 2️⃣ Convert business time to UTC
-    const zonedTime = DateTime.fromISO(appointment_time, { zone: business.timezone });
-    const utcDateTime = zonedTime.toUTC();
+    const maxPerSlot =
+      business?.appointment_settings?.max_appointments_per_slot ?? 1;
 
-    if (utcDateTime < DateTime.now().toUTC()) {
-      return res.status(400).json({
-        error: 'Appointment time cannot be in the past'
+    /* --------------------------------------------------
+       4️⃣ Enforce slot capacity
+    -------------------------------------------------- */
+
+    const { count, error: countError } = await supabase
+  .from('appointments')
+  .select('*', { count: 'exact', head: true })
+  .eq('business_id', businessId)
+  .eq('status', 'scheduled')
+  .eq('slot_minutes', slot_minutes);
+
+
+    if (countError) {
+      return res.status(500).json({ error: countError.message });
+    }
+
+    if (count >= maxPerSlot) {
+      return res.status(409).json({
+        error: 'Selected time slot is fully booked',
       });
     }
 
-    const utcTime = utcDateTime.toISO();
+    /* --------------------------------------------------
+       5️⃣ Create appointment
+    -------------------------------------------------- */
 
-    // 3️⃣ Insert with UTC time
-    const { data, error } = await supabase
+    const { data: appointment, error: insertError } = await supabase
       .from('appointments')
-      .insert([
-        {
-          business_id: businessId,
-          customer_id,
-          service,
-          appointment_time: utcTime
-        }
-      ])
+      .insert({
+        business_id: businessId,
+        customer_id: customer.id,
+        service,
+        duration_minutes,
+        appointment_time: appointment_utc_time,
+        slot_minutes,
+        status: 'scheduled',
+      })
       .select()
       .single();
 
-    if (error) {
-      return res.status(500).json({ error: error.message });
+    if (insertError) {
+      return res.status(500).json({ error: insertError.message });
     }
 
-    res.json({ success: true, appointment_time: utcTime });
+    res.json(appointment);
   } catch (err) {
-    return res.status(400).json({ error: err.message });
+    console.error('Create appointment error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 app.post('/conversations/read', requireAuth, async (req, res) => {
   const { customer_id } = req.body;
@@ -726,6 +799,7 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
     reminder_2h,
     no_show_grace_minutes,
     default_duration_minutes,
+    max_appointments_per_slot,
   } = req.body;
 
   // Basic validation
@@ -733,7 +807,8 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
     typeof reminder_24h !== 'boolean' ||
     typeof reminder_2h !== 'boolean' ||
     typeof no_show_grace_minutes !== 'number' ||
-    typeof default_duration_minutes !== 'number'
+    typeof default_duration_minutes !== 'number' ||
+    typeof max_appointments_per_slot !== 'number'
   ) {
     return res.status(400).json({ error: 'Invalid settings payload' });
   }
@@ -746,6 +821,7 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
         reminder_2h,
         no_show_grace_minutes,
         default_duration_minutes,
+        max_appointments_per_slot,
       },
     })
     .eq('id', businessId)
@@ -755,112 +831,158 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
   if (error) {
     return res.status(500).json({ error: error.message });
   }
-/* 🔄 SYNC REMINDER SETTINGS → AUTOMATION RULES */
+  /* 🔄 SYNC REMINDER SETTINGS → AUTOMATION RULES */
 
-// 24h reminder
-await supabase
-  .from('automation_rules')
-  .update({ enabled: reminder_24h })
-  .eq('business_id', businessId)
-  .eq('rule_type', 'reminder_24h');
+  // 24h reminder
+  await supabase
+    .from('automation_rules')
+    .update({ enabled: reminder_24h })
+    .eq('business_id', businessId)
+    .eq('rule_type', 'reminder_24h');
 
-// 2h reminder
-await supabase
-  .from('automation_rules')
-  .update({ enabled: reminder_2h })
-  .eq('business_id', businessId)
-  .eq('rule_type', 'reminder_2h');
+  // 2h reminder
+  await supabase
+    .from('automation_rules')
+    .update({ enabled: reminder_2h })
+    .eq('business_id', businessId)
+    .eq('rule_type', 'reminder_2h');
 
   res.json(data.appointment_settings);
 });
 
-
-app.patch('/appointments/:id/reschedule', requireAuth, async (req, res) => {
+app.get('/appointments/availability', requireAuth, async (req, res) => {
   const businessId = req.businessId;
-  const { id } = req.params;
-  const { appointment_time } = req.body;
+  const { date,excludeAppointmentId } = req.query;
 
-  if (!appointment_time) {
-    return res.status(400).json({
-      error: 'appointment_time is required'
-    });
+  if (!date) {
+    return res.status(400).json({ error: 'date is required (YYYY-MM-DD)' });
   }
 
-  try {
-    // 1️⃣ Fetch business timezone
-    const { data: business, error: bizError } = await supabase
-      .from('businesses')
-      .select('timezone')
-      .eq('id', businessId)
-      .single();
+  // Start/end of day in UTC
+  const dayStart = `${date}T00:00:00Z`;
+  const dayEnd = `${date}T23:59:59Z`;
 
-    if (bizError || !business?.timezone) {
-      return res.status(500).json({
-        error: 'Business timezone not found'
-      });
-    }
+  // Fetch scheduled appointments for that day
+  let query = supabase
+  .from('appointments')
+  .select('appointment_time')
+  .eq('business_id', businessId)
+  .eq('status', 'scheduled')
+  .gte('appointment_time', dayStart)
+  .lte('appointment_time', dayEnd);
 
-    // 2️⃣ Ensure appointment belongs to this business
-    const { data: appointment, error: fetchError } = await supabase
-      .from('appointments')
-      .select('id')
-      .eq('id', id)
-      .eq('business_id', businessId)
-      .single();
+if (excludeAppointmentId) {
+  query = query.neq('id', excludeAppointmentId);
+}
 
-    if (fetchError || !appointment) {
-      return res.status(404).json({
-        error: 'Appointment not found'
-      });
-    }
+const { data: appointments, error } = await query;
 
-    // 3️⃣ Convert business-local time → UTC
-    const zonedTime = DateTime.fromISO(appointment_time, {
-      zone: business.timezone
-    });
 
-    if (!zonedTime.isValid) {
-      return res.status(400).json({
-        error: 'Invalid appointment_time'
-      });
-    }
-    const newUtc = DateTime.fromISO(appointment_time, {
-      zone: business.timezone
-    }).toUTC();
-
-    if (newUtc < DateTime.now().toUTC()) {
-      return res.status(400).json({
-        error: 'Rescheduled time cannot be in the past'
-      });
-    }
-
-    const utcTime = zonedTime.toUTC().toISO();
-
-    // 🔥 Clear old automation logs so reminders can fire again
-    await supabase
-      .from('automation_logs')
-      .delete()
-      .eq('appointment_id', id);
-    // 4️⃣ Update appointment
-    const { data, error } = await supabase
-      .from('appointments')
-      .update({
-        appointment_time: utcTime,
-        status: 'scheduled'
-      })
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  if (error) {
+    return res.status(500).json({ error: error.message });
   }
+
+  // Count appointments per slot (minutes since midnight)
+  const counts = {};
+
+  for (const appt of appointments) {
+    const dateObj = new Date(appt.appointment_time);
+    const minutes =
+      dateObj.getUTCHours() * 60 + dateObj.getUTCMinutes();
+
+    counts[minutes] = (counts[minutes] || 0) + 1;
+  }
+
+  res.json({ slots: counts });
 });
+
+app.patch(
+  '/appointments/:id/reschedule-slot',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const businessId = req.businessId;
+      const appointmentId = req.params.id;
+
+      const { appointment_utc_time, duration_minutes } = req.body;
+
+      if (!appointment_utc_time || !duration_minutes) {
+        return res.status(400).json({ error: 'Invalid payload' });
+      }
+
+      // 1️⃣ Verify appointment
+      const { data: appointment } = await supabase
+        .from('appointments')
+        .select('*')
+        .eq('id', appointmentId)
+        .eq('business_id', businessId)
+        .single();
+
+      if (!appointment) {
+        return res.status(404).json({ error: 'Appointment not found' });
+      }
+
+      // 2️⃣ Compute slot minutes (UTC)
+      const d = new Date(appointment_utc_time);
+      const slot_minutes =
+        d.getUTCHours() * 60 + d.getUTCMinutes();
+
+      // 3️⃣ Fetch business capacity
+      const { data: biz } = await supabase
+        .from('businesses')
+        .select('appointment_settings')
+        .eq('id', businessId)
+        .single();
+
+      const maxPerSlot =
+        biz?.appointment_settings?.max_appointments_per_slot ?? 1;
+
+      // 4️⃣ Capacity check (exclude self)
+      const { count } = await supabase
+        .from('appointments')
+        .select('*', { count: 'exact', head: true })
+        .eq('business_id', businessId)
+        .eq('status', 'scheduled')
+        .eq('slot_minutes', slot_minutes)
+        .neq('id', appointmentId);
+
+      if (count >= maxPerSlot) {
+        return res
+          .status(409)
+          .json({ error: 'Slot fully booked' });
+      }
+
+      // 5️⃣ Update appointment
+      const { data: updated, error } = await supabase
+        .from('appointments')
+        .update({
+          appointment_time: appointment_utc_time,
+          slot_minutes,
+          duration_minutes,
+          status: 'scheduled',
+        })
+        .eq('id', appointmentId)
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+
+      // 6️⃣ Clear automation logs
+      await supabase
+        .from('automation_logs')
+        .delete()
+        .eq('appointment_id', appointmentId);
+
+      res.json(updated);
+    } catch (err) {
+      console.error('Reschedule error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
 
 app.get('/automation-rules', requireAuth, async (req, res) => {
   const businessId = req.businessId;
@@ -877,6 +999,35 @@ app.get('/automation-rules', requireAuth, async (req, res) => {
 
   res.json(data);
 });
+
+app.get('/businesses/settings/appointments', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+
+  const { data, error } = await supabase
+    .from('businesses')
+    .select('appointment_settings')
+    .eq('id', businessId)
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  // ✅ Safe defaults (VERY IMPORTANT)
+  const settings = {
+    reminder_24h: data.appointment_settings?.reminder_24h ?? true,
+    reminder_2h: data.appointment_settings?.reminder_2h ?? false,
+    no_show_grace_minutes:
+      data.appointment_settings?.no_show_grace_minutes ?? 30,
+    default_duration_minutes:
+      data.appointment_settings?.default_duration_minutes ?? 30,
+    max_appointments_per_slot:
+      data.appointment_settings?.max_appointments_per_slot ?? 1,
+  };
+
+  res.json(settings);
+});
+
 
 app.patch('/automation-rules/:ruleId', requireAuth, async (req, res) => {
   const { ruleId } = req.params;
