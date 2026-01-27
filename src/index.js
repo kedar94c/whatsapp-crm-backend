@@ -57,6 +57,13 @@ async function requireAuth(req, res, next) {
     return res.status(500).json({ error: err.message });
   }
 }
+function formatAppointmentTime(utcISO, timezone) {
+  return DateTime
+    .fromISO(utcISO, { zone: 'UTC' })
+    .setZone(timezone)
+    .toFormat('dd LLL, hh:mm a');
+}
+
 
 app.get('/me', requireAuth, async (req, res) => {
   try {
@@ -120,6 +127,35 @@ async function sendWhatsAppMessage(phone, text) {
   }
 }
 
+async function sendAndLogSystemMessage({
+  customerId,
+  phone,
+  businessTimezone,
+  content,
+}) {
+  // 1️⃣ Insert into messages table
+  const { data: message, error } = await supabase
+    .from('messages')
+    .insert({
+      customer_id: customerId,
+      direction: 'out',
+      content,
+      status: 'sent',
+      message_type: 'system',
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Failed to log system message:', error.message);
+    // still attempt WhatsApp send
+  }
+
+  // 2️⃣ Send WhatsApp message
+  await sendWhatsAppMessage(phone, content);
+
+  return message;
+}
 
 
 // test route
@@ -346,7 +382,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
 
     const { data: business, error: bizError } = await supabase
       .from('businesses')
-      .select('appointment_settings')
+      .select('appointment_settings, timezone') 
       .eq('id', businessId)
       .single();
 
@@ -362,11 +398,11 @@ app.post('/appointments', requireAuth, async (req, res) => {
     -------------------------------------------------- */
 
     const { count, error: countError } = await supabase
-  .from('appointments')
-  .select('*', { count: 'exact', head: true })
-  .eq('business_id', businessId)
-  .eq('status', 'scheduled')
-  .eq('slot_minutes', slot_minutes);
+      .from('appointments')
+      .select('*', { count: 'exact', head: true })
+      .eq('business_id', businessId)
+      .eq('status', 'scheduled')
+      .eq('slot_minutes', slot_minutes);
 
 
     if (countError) {
@@ -394,9 +430,33 @@ app.post('/appointments', requireAuth, async (req, res) => {
         slot_minutes,
         status: 'scheduled',
       })
-      .select()
+      .select('*, customers(phone)')
       .single();
 
+    // 📩 Send WhatsApp confirmation
+    const formattedTime = formatAppointmentTime(
+      appointment.appointment_time,
+      business.timezone || 'UTC'
+    );
+
+    const message = `
+✅ Your appointment is confirmed.
+
+🛎 Service: ${appointment.service}
+📅 Date & Time: ${formattedTime}
+
+Reply here if you need to reschedule.
+`.trim();
+
+    await sendAndLogSystemMessage({
+      customerId: customer.id,
+      phone: customer.phone,
+      businessTimezone: business.timezone,
+      content: message,
+    });
+
+
+    ////
     if (insertError) {
       return res.status(500).json({ error: insertError.message });
     }
@@ -773,8 +833,9 @@ app.patch('/appointments/:id/status', requireAuth, async (req, res) => {
       .from('appointments')
       .update({ status })
       .eq('id', id)
-      .select()
+      .select('*, customers(phone)')
       .single();
+
 
     if (error) {
       return res.status(500).json({ error: error.message });
@@ -852,7 +913,7 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
 
 app.get('/appointments/availability', requireAuth, async (req, res) => {
   const businessId = req.businessId;
-  const { date,excludeAppointmentId } = req.query;
+  const { date, excludeAppointmentId } = req.query;
 
   if (!date) {
     return res.status(400).json({ error: 'date is required (YYYY-MM-DD)' });
@@ -864,18 +925,18 @@ app.get('/appointments/availability', requireAuth, async (req, res) => {
 
   // Fetch scheduled appointments for that day
   let query = supabase
-  .from('appointments')
-  .select('appointment_time')
-  .eq('business_id', businessId)
-  .eq('status', 'scheduled')
-  .gte('appointment_time', dayStart)
-  .lte('appointment_time', dayEnd);
+    .from('appointments')
+    .select('appointment_time')
+    .eq('business_id', businessId)
+    .eq('status', 'scheduled')
+    .gte('appointment_time', dayStart)
+    .lte('appointment_time', dayEnd);
 
-if (excludeAppointmentId) {
-  query = query.neq('id', excludeAppointmentId);
-}
+  if (excludeAppointmentId) {
+    query = query.neq('id', excludeAppointmentId);
+  }
 
-const { data: appointments, error } = await query;
+  const { data: appointments, error } = await query;
 
 
   if (error) {
@@ -962,12 +1023,38 @@ app.patch(
           status: 'scheduled',
         })
         .eq('id', appointmentId)
-        .select()
+        .select('*, customers(phone)')
         .single();
 
       if (error) {
         return res.status(500).json({ error: error.message });
       }
+
+      const { data: business } = await supabase
+        .from('businesses')
+        .select('timezone')
+        .eq('id', businessId)
+        .single();
+
+      const formattedTime = formatAppointmentTime(
+        updated.appointment_time,
+        business.timezone || 'UTC'
+      );
+
+      const message = `
+🔁 Your appointment has been rescheduled.
+
+🛎 Service: ${updated.service}
+📅 New time: ${formattedTime}
+
+Reply here if you need help.
+`.trim();
+
+      await sendAndLogSystemMessage({
+        customerId: updated.customer_id,
+        phone: updated.customers.phone,
+        content: message,
+      });
 
       // 6️⃣ Clear automation logs
       await supabase
