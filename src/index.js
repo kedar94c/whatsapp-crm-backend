@@ -311,8 +311,67 @@ app.get('/customers/:id/messages', requireAuth, async (req, res) => {
   res.json(data);
 });
 
+app.get('/services', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('services')
+    .select('*')
+    .eq('business_id', req.businessId)
+    .eq('is_active', true)
+    .order('created_at');
 
-import { fromZonedTime } from 'date-fns-tz';
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/services', requireAuth, async (req, res) => {
+  if (req.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owner can add services' });
+  }
+
+  const { name, duration_minutes } = req.body;
+
+  if (!name || !duration_minutes) {
+    return res.status(400).json({ error: 'Invalid payload' });
+  }
+
+  const { data, error } = await supabase
+    .from('services')
+    .insert({
+      business_id: req.businessId,
+      name,
+      duration_minutes,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.patch('/services/:id', requireAuth, async (req, res) => {
+  const businessId = req.businessId;
+  const { id } = req.params;
+  const { name, duration_minutes, is_active } = req.body;
+
+  const updates = {};
+  if (name !== undefined) updates.name = name;
+  if (duration_minutes !== undefined) updates.duration_minutes = duration_minutes;
+  if (is_active !== undefined) updates.is_active = is_active;
+
+  const { data, error } = await supabase
+    .from('services')
+    .update(updates)
+    .eq('id', id)
+    .eq('business_id', businessId)
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  res.json(data);
+});
 
 app.post('/appointments', requireAuth, async (req, res) => {
   try {
@@ -859,7 +918,6 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
     reminder_24h,
     reminder_2h,
     no_show_grace_minutes,
-    default_duration_minutes,
     max_appointments_per_slot,
   } = req.body;
 
@@ -868,7 +926,6 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
     typeof reminder_24h !== 'boolean' ||
     typeof reminder_2h !== 'boolean' ||
     typeof no_show_grace_minutes !== 'number' ||
-    typeof default_duration_minutes !== 'number' ||
     typeof max_appointments_per_slot !== 'number'
   ) {
     return res.status(400).json({ error: 'Invalid settings payload' });
@@ -881,7 +938,6 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
         reminder_24h,
         reminder_2h,
         no_show_grace_minutes,
-        default_duration_minutes,
         max_appointments_per_slot,
       },
     })
@@ -1106,8 +1162,6 @@ app.get('/businesses/settings/appointments', requireAuth, async (req, res) => {
     reminder_2h: data.appointment_settings?.reminder_2h ?? false,
     no_show_grace_minutes:
       data.appointment_settings?.no_show_grace_minutes ?? 30,
-    default_duration_minutes:
-      data.appointment_settings?.default_duration_minutes ?? 30,
     max_appointments_per_slot:
       data.appointment_settings?.max_appointments_per_slot ?? 1,
   };
