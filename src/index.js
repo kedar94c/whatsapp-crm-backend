@@ -349,20 +349,18 @@ app.post('/services', requireAuth, async (req, res) => {
 });
 
 app.patch('/services/:id', requireAuth, async (req, res) => {
-  const businessId = req.businessId;
   const { id } = req.params;
   const { name, duration_minutes, is_active } = req.body;
 
-  const updates = {};
-  if (name !== undefined) updates.name = name;
-  if (duration_minutes !== undefined) updates.duration_minutes = duration_minutes;
-  if (is_active !== undefined) updates.is_active = is_active;
-
   const { data, error } = await supabase
     .from('services')
-    .update(updates)
+    .update({
+      ...(name && { name }),
+      ...(duration_minutes && { duration_minutes }),
+      ...(typeof is_active === 'boolean' && { is_active }),
+    })
     .eq('id', id)
-    .eq('business_id', businessId)
+    .eq('business_id', req.businessId)
     .select()
     .single();
 
@@ -373,6 +371,7 @@ app.patch('/services/:id', requireAuth, async (req, res) => {
   res.json(data);
 });
 
+
 app.post('/appointments', requireAuth, async (req, res) => {
   try {
     console.log("CREATE APPOINTMENT payload:", req.body);
@@ -382,14 +381,28 @@ app.post('/appointments', requireAuth, async (req, res) => {
     const {
       phone,
       name,
-      service,
-      duration_minutes,
+      services,
       appointment_utc_time,
     } = req.body;
 
-    if (!phone || !appointment_utc_time || !duration_minutes) {
+    if (
+      !phone ||
+      !appointment_utc_time ||
+      !Array.isArray(services) ||
+      services.length === 0
+    ) {
       return res.status(400).json({ error: 'Invalid appointment payload' });
     }
+
+    const totalDurationMinutes = services.reduce(
+      (sum, s) => sum + Number(s.duration_minutes || 0),
+      0
+    );
+
+    if (totalDurationMinutes <= 0) {
+      return res.status(400).json({ error: 'Invalid service durations' });
+    }
+
 
     /* --------------------------------------------------
        1️⃣ Find or create customer
@@ -441,7 +454,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
 
     const { data: business, error: bizError } = await supabase
       .from('businesses')
-      .select('appointment_settings, timezone') 
+      .select('appointment_settings, timezone')
       .eq('id', businessId)
       .single();
 
@@ -483,14 +496,39 @@ app.post('/appointments', requireAuth, async (req, res) => {
       .insert({
         business_id: businessId,
         customer_id: customer.id,
-        service,
-        duration_minutes,
         appointment_time: appointment_utc_time,
         slot_minutes,
+        duration_minutes: totalDurationMinutes,
         status: 'scheduled',
       })
-      .select('*, customers(phone)')
+      .select()
       .single();
+
+
+    if (insertError) {
+      return res.status(500).json({ error: insertError.message });
+    }
+
+    const appointmentServices = services.map(s => ({
+      appointment_id: appointment.id,
+      service_id: s.service_id,
+      duration_minutes: s.duration_minutes,
+    }));
+
+    const { error: serviceError } = await supabase
+      .from('appointment_services')
+      .insert(appointmentServices);
+
+    if (serviceError) {
+      // rollback appointment
+      await supabase
+        .from('appointments')
+        .delete()
+        .eq('id', appointment.id);
+
+      return res.status(500).json({ error: serviceError.message });
+    }
+
 
     // 📩 Send WhatsApp confirmation
     const formattedTime = formatAppointmentTime(
@@ -501,7 +539,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
     const message = `
 ✅ Your appointment is confirmed.
 
-🛎 Service: ${appointment.service}
+🛎 Services: ${services.length} service(s)
 📅 Date & Time: ${formattedTime}
 
 Reply here if you need to reschedule.
@@ -569,16 +607,24 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('appointments')
     .select(`
+  id,
+  customer_id,
+  appointment_time,
+  status,
+  duration_minutes,
+  appointment_services (
+    duration_minutes,
+    services (
       id,
-      service,
-      appointment_time,
-      status,
-      customers (
-        id,
-        phone,
-        name
-      )
-    `)
+      name
+    )
+  ),
+  customers (
+    id,
+    name,
+    phone
+  )
+`)
     .eq('business_id', businessId)
     .eq('status', 'scheduled')
     .gte('appointment_time', now)
@@ -606,11 +652,16 @@ app.get('/appointments/next', requireAuth, async (req, res) => {
   const { data, error } = await supabase
     .from('appointments')
     .select(`
-      id,
-      service,
-      appointment_time,
-      status
-    `)
+  id,
+  appointment_time,
+  status,
+  appointment_services (
+    services (
+      name
+    )
+  )
+`)
+
     .eq('business_id', businessId)
     .eq('customer_id', customerId)
     .eq('status', 'scheduled')
@@ -633,17 +684,25 @@ app.get('/appointments', requireAuth, async (req, res) => {
     const { data, error } = await supabase
       .from('appointments')
       .select(`
-        id,
-        customer_id,
-        service,
-        appointment_time,
-        status,
-        customers (
-          id,
-          name,
-          phone
-        )
-      `)
+  id,
+  customer_id,
+  appointment_time,
+  status,
+  duration_minutes,
+  appointment_services (
+    duration_minutes,
+    services (
+      id,
+      name
+    )
+  ),
+  customers (
+    id,
+    name,
+    phone
+  )
+`)
+
       .eq('business_id', businessId)
       .order('status', {
         ascending: true,
@@ -1021,41 +1080,68 @@ app.patch(
       const businessId = req.businessId;
       const appointmentId = req.params.id;
 
-      const { appointment_utc_time, duration_minutes } = req.body;
+      const { appointment_utc_time } = req.body;
 
-      if (!appointment_utc_time || !duration_minutes) {
-        return res.status(400).json({ error: 'Invalid payload' });
+      if (!appointment_utc_time) {
+        return res.status(400).json({ error: 'appointment_utc_time is required' });
       }
 
-      // 1️⃣ Verify appointment
-      const { data: appointment } = await supabase
+      /* --------------------------------------------------
+         1️⃣ Verify appointment belongs to business
+      -------------------------------------------------- */
+      const { data: appointment, error: apptError } = await supabase
         .from('appointments')
         .select('*')
         .eq('id', appointmentId)
         .eq('business_id', businessId)
         .single();
 
-      if (!appointment) {
+      if (apptError || !appointment) {
         return res.status(404).json({ error: 'Appointment not found' });
       }
 
-      // 2️⃣ Compute slot minutes (UTC)
+      /* --------------------------------------------------
+         2️⃣ Load appointment services → compute duration
+      -------------------------------------------------- */
+      const { data: services, error: svcError } = await supabase
+        .from('appointment_services')
+        .select('duration_minutes')
+        .eq('appointment_id', appointmentId);
+
+      if (svcError || !services?.length) {
+        return res.status(400).json({
+          error: 'Appointment services missing. Cannot reschedule.',
+        });
+      }
+
+      const totalDurationMinutes = services.reduce(
+        (sum, s) => sum + s.duration_minutes,
+        0
+      );
+
+      /* --------------------------------------------------
+         3️⃣ Compute slot minutes (UTC)
+      -------------------------------------------------- */
       const d = new Date(appointment_utc_time);
       const slot_minutes =
         d.getUTCHours() * 60 + d.getUTCMinutes();
 
-      // 3️⃣ Fetch business capacity
+      /* --------------------------------------------------
+         4️⃣ Fetch business slot capacity
+      -------------------------------------------------- */
       const { data: biz } = await supabase
         .from('businesses')
-        .select('appointment_settings')
+        .select('appointment_settings, timezone')
         .eq('id', businessId)
         .single();
 
       const maxPerSlot =
         biz?.appointment_settings?.max_appointments_per_slot ?? 1;
 
-      // 4️⃣ Capacity check (exclude self)
-      const { count } = await supabase
+      /* --------------------------------------------------
+         5️⃣ Capacity check (exclude this appointment)
+      -------------------------------------------------- */
+      const { count, error: countError } = await supabase
         .from('appointments')
         .select('*', { count: 'exact', head: true })
         .eq('business_id', businessId)
@@ -1063,44 +1149,44 @@ app.patch(
         .eq('slot_minutes', slot_minutes)
         .neq('id', appointmentId);
 
-      if (count >= maxPerSlot) {
-        return res
-          .status(409)
-          .json({ error: 'Slot fully booked' });
+      if (countError) {
+        return res.status(500).json({ error: countError.message });
       }
 
-      // 5️⃣ Update appointment
-      const { data: updated, error } = await supabase
+      if (count >= maxPerSlot) {
+        return res.status(409).json({ error: 'Slot fully booked' });
+      }
+
+      /* --------------------------------------------------
+         6️⃣ Update appointment (time + duration)
+      -------------------------------------------------- */
+      const { data: updated, error: updateError } = await supabase
         .from('appointments')
         .update({
           appointment_time: appointment_utc_time,
           slot_minutes,
-          duration_minutes,
+          duration_minutes: totalDurationMinutes,
           status: 'scheduled',
         })
         .eq('id', appointmentId)
         .select('*, customers(phone)')
         .single();
 
-      if (error) {
-        return res.status(500).json({ error: error.message });
+      if (updateError) {
+        return res.status(500).json({ error: updateError.message });
       }
 
-      const { data: business } = await supabase
-        .from('businesses')
-        .select('timezone')
-        .eq('id', businessId)
-        .single();
-
+      /* --------------------------------------------------
+         7️⃣ Notify customer
+      -------------------------------------------------- */
       const formattedTime = formatAppointmentTime(
         updated.appointment_time,
-        business.timezone || 'UTC'
+        biz.timezone || 'UTC'
       );
 
       const message = `
 🔁 Your appointment has been rescheduled.
 
-🛎 Service: ${updated.service}
 📅 New time: ${formattedTime}
 
 Reply here if you need help.
@@ -1112,7 +1198,9 @@ Reply here if you need help.
         content: message,
       });
 
-      // 6️⃣ Clear automation logs
+      /* --------------------------------------------------
+         8️⃣ Clear automation logs (important)
+      -------------------------------------------------- */
       await supabase
         .from('automation_logs')
         .delete()
