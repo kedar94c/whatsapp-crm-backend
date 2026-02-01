@@ -11,6 +11,7 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+const SLOT_SIZE_MINUTES = 15;
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -62,6 +63,41 @@ function formatAppointmentTime(utcISO, timezone) {
     .fromISO(utcISO, { zone: 'UTC' })
     .setZone(timezone)
     .toFormat('dd LLL, hh:mm a');
+}
+
+function minutesToSlotIndex(minutes) {
+  return Math.floor(minutes / SLOT_SIZE_MINUTES);
+}
+
+function getSlotRange(startMinutes, durationMinutes) {
+  const startSlot = minutesToSlotIndex(startMinutes);
+  const slotCount = Math.ceil(durationMinutes / SLOT_SIZE_MINUTES);
+
+  return Array.from(
+    { length: slotCount },
+    (_, i) => startSlot + i
+  );
+}
+
+function buildSlotLoadMap(appointments) {
+  const slotLoad = {};
+
+  for (const appt of appointments) {
+    const date = new Date(appt.appointment_time);
+    const startMinutes =
+      date.getUTCHours() * 60 + date.getUTCMinutes();
+
+    const slots = getSlotRange(
+      startMinutes,
+      appt.duration_minutes
+    );
+
+    for (const slot of slots) {
+      slotLoad[slot] = (slotLoad[slot] || 0) + 1;
+    }
+  }
+
+  return slotLoad;
 }
 
 
@@ -470,23 +506,41 @@ app.post('/appointments', requireAuth, async (req, res) => {
        4️⃣ Enforce slot capacity
     -------------------------------------------------- */
 
-    const { count, error: countError } = await supabase
-      .from('appointments')
-      .select('*', { count: 'exact', head: true })
-      .eq('business_id', businessId)
-      .eq('status', 'scheduled')
-      .eq('slot_minutes', slot_minutes);
+    
+    // Fetch existing appointments for the day
+  const dayStart = appointment_utc_time.slice(0, 10) + 'T00:00:00Z';
+const dayEnd   = appointment_utc_time.slice(0, 10) + 'T23:59:59Z';
 
+const { data: existingAppointments, error: fetchError } = await supabase
+  .from('appointments')
+  .select('appointment_time, duration_minutes')
+  .eq('business_id', businessId)
+  .eq('status', 'scheduled')
+  .gte('appointment_time', dayStart)
+  .lte('appointment_time', dayEnd);
 
-    if (countError) {
-      return res.status(500).json({ error: countError.message });
-    }
+if (fetchError) {
+  return res.status(500).json({ error: fetchError.message });
+}
+    // Build slot load
+    const slotLoad = buildSlotLoadMap(existingAppointments);
 
-    if (count >= maxPerSlot) {
-      return res.status(409).json({
-        error: 'Selected time slot is fully booked',
-      });
-    }
+    // 3️⃣ Check required slots for this appointment
+const startSlotIndex = Math.floor(slot_minutes / SLOT_SIZE_MINUTES);
+const requiredSlots = Math.ceil(
+  totalDurationMinutes / SLOT_SIZE_MINUTES
+);
+
+for (let i = 0; i < requiredSlots; i++) {
+  const slotIndex = startSlotIndex + i;
+  const load = slotLoad[slotIndex] || 0;
+
+  if (load >= maxPerSlot) {
+    return res.status(409).json({
+      error: 'Selected time slot is fully booked',
+    });
+  }
+}
 
     /* --------------------------------------------------
        5️⃣ Create appointment
@@ -501,7 +555,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
         slot_minutes,
         duration_minutes: totalDurationMinutes,
         status: 'scheduled',
-        combo_id:combo_id?? null,
+        combo_id: combo_id ?? null,
       })
       .select()
       .single();
@@ -608,7 +662,7 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
 
   const { data, error } = await supabase
     .from('appointments')
- .select(`
+    .select(`
   id,
   appointment_time,
   status,
@@ -693,7 +747,7 @@ app.get('/appointments', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('appointments')
-     .select(`
+      .select(`
   id,
   customer_id,
   appointment_time,
@@ -1143,7 +1197,23 @@ app.patch('/businesses/settings/appointments', requireAuth, async (req, res) => 
 
 app.get('/appointments/availability', requireAuth, async (req, res) => {
   const businessId = req.businessId;
-  const { date, excludeAppointmentId } = req.query;
+  const { date, excludeAppointmentId, duration_minutes } = req.query;
+
+const durationMinutes = Number(duration_minutes);
+console.log('AVAILABILITY QUERY:', {
+  date: req.query.date,
+  duration_minutes: req.query.duration_minutes,
+});
+console.log('Parsed durationMinutes:', durationMinutes);
+
+
+
+if (!durationMinutes || durationMinutes <= 0) {
+  return res.status(400).json({
+    error: 'duration_minutes is required',
+  });
+}
+
 
   if (!date) {
     return res.status(400).json({ error: 'date is required (YYYY-MM-DD)' });
@@ -1152,11 +1222,12 @@ app.get('/appointments/availability', requireAuth, async (req, res) => {
   // Start/end of day in UTC
   const dayStart = `${date}T00:00:00Z`;
   const dayEnd = `${date}T23:59:59Z`;
+  
 
   // Fetch scheduled appointments for that day
   let query = supabase
     .from('appointments')
-    .select('appointment_time')
+    .select('appointment_time, duration_minutes')
     .eq('business_id', businessId)
     .eq('status', 'scheduled')
     .gte('appointment_time', dayStart)
@@ -1173,24 +1244,48 @@ app.get('/appointments/availability', requireAuth, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  // Count appointments per slot (minutes since midnight)
-  const counts = {};
+  // Count appointments per slot
+  const { data: business } = await supabase
+    .from('businesses')
+    .select('appointment_settings, timezone')
+    .eq('id', businessId)
+    .single();
 
-  for (const appt of appointments) {
-    const dateObj = new Date(appt.appointment_time);
-    const minutes =
-      dateObj.getUTCHours() * 60 + dateObj.getUTCMinutes();
+  const maxPerSlot =
+    business?.appointment_settings?.max_appointments_per_slot ?? 1;
 
-    counts[minutes] = (counts[minutes] || 0) + 1;
-  }
+  // 1️⃣ Build slot load
+  const slotLoad = buildSlotLoadMap(appointments);
 
-  res.json({ slots: counts });
+  // 2️⃣ Generate availability by START slot (frontend-compatible)
+const availability = {};
+
+// Iterate over possible START times in 15-min steps
+for (
+  let startMinutes = 0;
+  startMinutes + durationMinutes <= 24 * 60;
+  startMinutes += SLOT_SIZE_MINUTES
+) {
+  const requiredSlots = getSlotRange(
+    startMinutes,
+    durationMinutes
+  );
+
+  const isAvailable = requiredSlots.every(
+    slot => (slotLoad[slot] || 0) < maxPerSlot
+  );
+
+  availability[startMinutes] = isAvailable;
+}
+
+  res.json({
+    slotSize: SLOT_SIZE_MINUTES,
+    slots: availability,
+  });
+
 });
 
-app.patch(
-  '/appointments/:id/reschedule-slot',
-  requireAuth,
-  async (req, res) => {
+app.patch('/appointments/:id/reschedule-slot', requireAuth, async (req, res) => {
     try {
       const businessId = req.businessId;
       const appointmentId = req.params.id;
@@ -1253,24 +1348,49 @@ app.patch(
       const maxPerSlot =
         biz?.appointment_settings?.max_appointments_per_slot ?? 1;
 
-      /* --------------------------------------------------
-         5️⃣ Capacity check (exclude this appointment)
-      -------------------------------------------------- */
-      const { count, error: countError } = await supabase
-        .from('appointments')
-        .select('*', { count: 'exact', head: true })
-        .eq('business_id', businessId)
-        .eq('status', 'scheduled')
-        .eq('slot_minutes', slot_minutes)
-        .neq('id', appointmentId);
+ /* --------------------------------------------------
+   5️⃣ Duration-aware capacity check
+-------------------------------------------------- */
 
-      if (countError) {
-        return res.status(500).json({ error: countError.message });
-      }
+// Fetch same-day appointments excluding this one
+const dayStart = appointment_utc_time.slice(0, 10) + 'T00:00:00Z';
+const dayEnd   = appointment_utc_time.slice(0, 10) + 'T23:59:59Z';
 
-      if (count >= maxPerSlot) {
-        return res.status(409).json({ error: 'Slot fully booked' });
-      }
+const { data: existingAppointments, error: fetchError } = await supabase
+  .from('appointments')
+  .select('appointment_time, duration_minutes')
+  .eq('business_id', businessId)
+  .eq('status', 'scheduled')
+  .neq('id', appointmentId)
+  .gte('appointment_time', dayStart)
+  .lte('appointment_time', dayEnd);
+
+if (fetchError) {
+  return res.status(500).json({ error: fetchError.message });
+}
+
+// Build slot load map
+const slotLoad = buildSlotLoadMap(existingAppointments);
+
+// Required slots for this appointment
+const startSlotIndex = Math.floor(slot_minutes / SLOT_SIZE_MINUTES);
+const requiredSlots = Math.ceil(
+  totalDurationMinutes / SLOT_SIZE_MINUTES
+);
+
+// Validate every slot
+for (let i = 0; i < requiredSlots; i++) {
+  const slotIndex = startSlotIndex + i;
+  const load = slotLoad[slotIndex] || 0;
+
+  if (load >= maxPerSlot) {
+    return res.status(409).json({
+      error: 'Selected time slot is fully booked',
+    });
+  }
+}
+
+
 
       /* --------------------------------------------------
          6️⃣ Update appointment (time + duration)
