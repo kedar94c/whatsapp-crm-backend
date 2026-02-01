@@ -383,6 +383,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
       name,
       services,
       appointment_utc_time,
+      combo_id,
     } = req.body;
 
     if (
@@ -500,6 +501,7 @@ app.post('/appointments', requireAuth, async (req, res) => {
         slot_minutes,
         duration_minutes: totalDurationMinutes,
         status: 'scheduled',
+        combo_id:combo_id?? null,
       })
       .select()
       .single();
@@ -606,25 +608,26 @@ app.get('/appointments/upcoming', requireAuth, async (req, res) => {
 
   const { data, error } = await supabase
     .from('appointments')
-    .select(`
+ .select(`
   id,
-  customer_id,
   appointment_time,
   status,
-  duration_minutes,
+  combo_id,
+  service_combos (
+    id,
+    name
+  ),
   appointment_services (
-    duration_minutes,
+    service_id,
     services (
       id,
       name
     )
-  ),
-  customers (
-    id,
-    name,
-    phone
   )
 `)
+
+
+
     .eq('business_id', businessId)
     .eq('status', 'scheduled')
     .gte('appointment_time', now)
@@ -655,12 +658,19 @@ app.get('/appointments/next', requireAuth, async (req, res) => {
   id,
   appointment_time,
   status,
+  combo_id,
+  service_combos (
+    id,
+    name
+  ),
   appointment_services (
     services (
+      id,
       name
     )
   )
 `)
+
 
     .eq('business_id', businessId)
     .eq('customer_id', customerId)
@@ -683,17 +693,25 @@ app.get('/appointments', requireAuth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('appointments')
-      .select(`
+     .select(`
   id,
   customer_id,
   appointment_time,
   status,
+  combo_id,
   duration_minutes,
   appointment_services (
     duration_minutes,
     services (
       id,
-      name
+      name,
+      service_combo_items (
+        combo_id,
+        service_combos (
+          id,
+          name
+        )
+      )
     )
   ),
   customers (
@@ -702,6 +720,7 @@ app.get('/appointments', requireAuth, async (req, res) => {
     phone
   )
 `)
+
 
       .eq('business_id', businessId)
       .order('status', {
@@ -823,6 +842,102 @@ cron.schedule('* * * * *', async () => {
   } catch (err) {
     console.error('Automation cron error:', err.message);
   }
+});
+
+app.post('/service-combos', requireAuth, async (req, res) => {
+  if (req.role !== 'owner') {
+    return res.status(403).json({ error: 'Only owner allowed' });
+  }
+
+  const { name, service_ids } = req.body;
+
+  if (
+    !name ||
+    !Array.isArray(service_ids) ||
+    service_ids.length === 0
+  ) {
+    return res.status(400).json({
+      error: 'name and service_ids[] are required'
+    });
+  }
+
+  // 🔒 Validate services belong to business
+  const { data: services, error: svcError } = await supabase
+    .from('services')
+    .select('id')
+    .eq('business_id', req.businessId)
+    .in('id', service_ids);
+
+  if (svcError || services.length !== service_ids.length) {
+    return res.status(400).json({
+      error: 'One or more services are invalid'
+    });
+  }
+
+  // 1️⃣ Create combo
+  const { data: combo, error } = await supabase
+    .from('service_combos')
+    .insert({
+      business_id: req.businessId,
+      name
+    })
+    .select()
+    .single();
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  // 2️⃣ Create combo items
+  const items = service_ids.map((id, idx) => ({
+    combo_id: combo.id,
+    service_id: id,
+    sort_order: idx
+  }));
+
+  const { error: itemError } = await supabase
+    .from('service_combo_items')
+    .insert(items);
+
+  if (itemError) {
+    return res.status(500).json({ error: itemError.message });
+  }
+
+  res.json(combo);
+});
+
+
+app.patch('/service-combos/:id', requireAuth, async (req, res) => {
+  await supabase
+    .from('service_combos')
+    .update({ is_active: false })
+    .eq('id', req.params.id)
+    .eq('business_id', req.businessId);
+
+  res.json({ success: true });
+});
+
+
+app.get('/service-combos', requireAuth, async (req, res) => {
+  const { data, error } = await supabase
+    .from('service_combos')
+    .select(`
+      id,
+      name,
+      service_combo_items (
+        service_id,
+        services (
+          id,
+          name,
+          duration_minutes
+        )
+      )
+    `)
+    .eq('business_id', req.businessId)
+    .eq('is_active', true);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 async function autoMarkNoShows() {
@@ -1278,7 +1393,24 @@ app.patch('/automation-rules/:ruleId', requireAuth, async (req, res) => {
     .update(updates)
     .eq('id', ruleId)
     .eq('business_id', businessId)
-    .select()
+    .select(`
+  *,
+  appointment_services (
+    service_id,
+    services (
+      id,
+      name,
+      service_combo_items (
+        combo_id,
+        service_combos (
+          id,
+          name
+        )
+      )
+    )
+  )
+`)
+
     .single();
 
   if (error) {
